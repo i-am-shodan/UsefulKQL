@@ -1,0 +1,2 @@
+# UsefulKQL
+ KQL that useful
