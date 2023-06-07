@@ -1,0 +1,56 @@
+// This query returns a table of drivers that people like the WDAC team and LOLDrivers have said are bad
+
+// Get list of bash hashes for drivers/files from the published WDAC documentation page
+let ParseWDACDocs=(T:(ResponseBody:string, RuleFileName:string)) {
+    T
+    | extend Body = tostring(ResponseBody)
+    | extend Data = extract_all(@"```xml([^`]+)```", dynamic([1]), Body)
+    | mv-expand Data
+    | extend XML=parse_xml(tostring(Data))
+    | extend FileRules=XML['SiPolicy']['FileRules']
+    | mv-expand FileRules
+    | extend DenyRules = FileRules["Deny"]
+    | extend AllowRules = FileRules["Allow"]
+    | extend FileAttribRules = FileRules["FileAttrib"]
+    | project DenyRules, AllowRules, FileAttribRules, RuleFileName
+};
+let ExpandRules = (T:(Rules:dynamic, RuleFileName:string), type:string) {
+    T
+    | extend Type=type
+    | extend ID=tostring(Rules['@ID'])
+    | extend FriendlyName=tostring(Rules['@FriendlyName'])
+    | extend FileName=tostring(Rules['@FileName'])
+    | extend MaximumFileVersion=tostring(Rules['@MaximumFileVersion'])
+    | extend MinimumFileVersion=tostring(Rules['@MinimumFileVersion'])
+    | extend Hash=tostring(Rules['@Hash'])
+    | extend AlternativeFilename=extract(@"^([\w\d.]+)[\s\\].+$", 1, FriendlyName, typeof(string))
+    | extend AlternativeFilename2=iff(RuleFileName contains "-driver-" and AlternativeFilename !endswith ".sys", strcat(AlternativeFilename, ".sys"), AlternativeFilename)
+    | extend FileName=coalesce(FileName, AlternativeFilename2)
+    | project-away Rules, AlternativeFilename, AlternativeFilename2
+};
+let RecommendedBlockRulesRawData=externaldata (ResponseBody:string) [@"https://raw.githubusercontent.com/MicrosoftDocs/windows-itpro-docs/public/windows/security/threat-protection/windows-defender-application-control/microsoft-recommended-block-rules.md"] with (format="raw")
+| extend RuleFileName="microsoft-recommended-block-rules.md";
+let RecommendedBlockRules=ParseWDACDocs(RecommendedBlockRulesRawData);
+let RecommendedDriverBlockRulesRawData=externaldata (ResponseBody:string) [@"https://raw.githubusercontent.com/MicrosoftDocs/windows-itpro-docs/public/windows/security/threat-protection/windows-defender-application-control/microsoft-recommended-driver-block-rules.md"] with (format="raw")
+| extend RuleFileName="microsoft-recommended-driver-block-rules.md";
+let RecommendedDriverBlockRules=ParseWDACDocs(RecommendedDriverBlockRulesRawData);
+let WDACRules=RecommendedBlockRules | union RecommendedDriverBlockRules;
+let DenyRulesRaw=WDACRules | where DenyRules != "" | mv-expand DenyRules | project Rules=DenyRules, RuleFileName;
+let AllowRulesRaw=WDACRules | where AllowRules != "" | mv-expand AllowRules | project Rules=AllowRules, RuleFileName;
+let FileAttribRulesRaw=WDACRules | where FileAttribRules != "" | mv-expand FileAttribRules | project Rules=FileAttribRules, RuleFileName;
+let WDACRulesParsed=ExpandRules(DenyRulesRaw, "Deny")
+| union ExpandRules(AllowRulesRaw, "Allow")
+| union ExpandRules(FileAttribRulesRaw, "FileAttrib")
+| extend Source="WDAC";
+// Now get LOLDrivers data
+let LOLDrivers=externaldata (CSVData:string) [@"https://raw.githubusercontent.com/magicsword-io/LOLDrivers/main/loldrivers.io/content/drivers_table.csv"] with (format="txt",ignoreFirstRecord=false) // reading each line as a string
+| project CSVDataDyn=parse_csv(CSVData)
+| extend Name=CSVDataDyn[0]
+| extend Sha256Packed=CSVDataDyn[1]
+| extend FriendlyText=CSVDataDyn[2]
+| extend Date=CSVDataDyn[3]
+| parse Name with "[" FileName "]" *
+| parse Sha256Packed with "[" Sha256 "]" *
+| project Source="LOLDrivers", RuleFileName="LOLDrivers", Type="Deny", FileName=tostring(FileName), FriendlyName=tostring(FriendlyText), Hash=Sha256;
+LOLDrivers
+| union WDACRulesParsed
